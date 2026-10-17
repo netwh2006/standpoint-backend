@@ -1,115 +1,94 @@
 
 import os
-import random
-from datetime import datetime
+import json
+import sqlite3
+import uuid
+from datetime import datetime, timezone
+from typing import Optional, Any
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sqlalchemy import (
-    create_engine, Column, Integer, String, DateTime,
-    ForeignKey, UniqueConstraint
+
+DB_PATH = os.getenv("DATABASE_PATH", "standpoint.db")
+
+app = FastAPI(title="STANDPOINT Matchmaking API", version="1.0.1")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-from sqlalchemy.orm import declarative_base, sessionmaker, Session
-
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./standpoint.db")
-
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
-elif DATABASE_URL.startswith("postgresql://"):
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
-
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False}
-    if DATABASE_URL.startswith("sqlite") else {},
-)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-Base = declarative_base()
-
-app = FastAPI(title="STANDPOINT API", version="0.1.0")
 
 
-class Player(Base):
-    __tablename__ = "players"
-
-    id = Column(Integer, primary_key=True, index=True)
-    telegram_id = Column(String, unique=True, nullable=False, index=True)
-    nickname = Column(String, nullable=False)
-    game_id = Column(String, nullable=False)
-    rating = Column(Integer, default=1000, nullable=False)
+def db():
+    con = sqlite3.connect(DB_PATH, timeout=15)
+    con.row_factory = sqlite3.Row
+    return con
 
 
-class QueueEntry(Base):
-    __tablename__ = "queue_entries"
-    __table_args__ = (
-        UniqueConstraint("player_id", name="uq_queue_player"),
-    )
-
-    id = Column(Integer, primary_key=True)
-    player_id = Column(Integer, ForeignKey("players.id"), nullable=False)
-    mode = Column(String, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-
-class Match(Base):
-    __tablename__ = "matches"
-
-    id = Column(Integer, primary_key=True)
-    mode = Column(String, nullable=False)
-    status = Column(String, default="waiting", nullable=False)
-    captain_player_id = Column(Integer, ForeignKey("players.id"))
-    map_name = Column(String, default="To be selected")
-    winner_team = Column(Integer, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-
-class MatchPlayer(Base):
-    __tablename__ = "match_players"
-    __table_args__ = (
-        UniqueConstraint("match_id", "player_id", name="uq_match_player"),
-    )
-
-    id = Column(Integer, primary_key=True)
-    match_id = Column(Integer, ForeignKey("matches.id"), nullable=False)
-    player_id = Column(Integer, ForeignKey("players.id"), nullable=False)
-    team = Column(Integer, nullable=False)
-    confirmed_result = Column(Integer, nullable=True)
+def init_db():
+    with db() as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS players (
+                telegram_id TEXT PRIMARY KEY,
+                nickname TEXT NOT NULL,
+                game_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS queue (
+                telegram_id TEXT PRIMARY KEY,
+                mode TEXT NOT NULL,
+                joined_at TEXT NOT NULL
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS matches (
+                match_id TEXT PRIMARY KEY,
+                mode TEXT NOT NULL,
+                status TEXT NOT NULL,
+                players_json TEXT NOT NULL,
+                result_json TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
 
 
-Base.metadata.create_all(bind=engine)
+init_db()
 
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+class RegisterPlayer(BaseModel):
+    telegram_id: str = Field(min_length=1, max_length=64)
+    nickname: str = Field(default="Игрок", max_length=64)
+    game_id: str = Field(min_length=1, max_length=64)
 
 
-class RegisterRequest(BaseModel):
-    telegram_id: str = Field(min_length=1, max_length=100)
-    nickname: str = Field(min_length=1, max_length=50)
-    game_id: str = Field(min_length=1, max_length=100)
+class JoinQueue(BaseModel):
+    telegram_id: str = Field(min_length=1, max_length=64)
+    mode: str = Field(default="5v5", max_length=16)
 
 
-class QueueRequest(BaseModel):
-    telegram_id: str
-    mode: str
+class LeaveQueue(BaseModel):
+    telegram_id: str = Field(min_length=1, max_length=64)
 
 
-class ResultRequest(BaseModel):
-    telegram_id: str
-    winner_team: int = Field(ge=1, le=2)
+class MatchResult(BaseModel):
+    winner: Optional[str] = None
+    result: Optional[Any] = None
+    telegram_id: Optional[str] = None
 
 
 @app.get("/")
 def root():
     return {
-        "name": "STANDPOINT API",
-        "version": "0.1.0",
-        "docs": "/docs",
-        "status": "online"
+        "service": "STANDPOINT Matchmaking API",
+        "status": "ok",
+        "docs": "/docs"
     }
 
 
@@ -119,261 +98,214 @@ def health():
 
 
 @app.post("/players/register")
-def register_player(data: RegisterRequest, db: Session = Depends(get_db)):
-    player = db.query(Player).filter_by(
-        telegram_id=data.telegram_id
-    ).first()
+def register_player(payload: RegisterPlayer):
+    now = datetime.now(timezone.utc).isoformat()
 
-    if player:
-        player.nickname = data.nickname
-        player.game_id = data.game_id
-    else:
-        player = Player(
-            telegram_id=data.telegram_id,
-            nickname=data.nickname,
-            game_id=data.game_id,
-            rating=1000,
-        )
-        db.add(player)
+    with db() as con:
+        con.execute("""
+            INSERT INTO players
+            (telegram_id, nickname, game_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+            nickname=excluded.nickname,
+            game_id=excluded.game_id,
+            updated_at=excluded.updated_at
+        """, (
+            payload.telegram_id,
+            payload.nickname.strip() or "Игрок",
+            payload.game_id.strip(),
+            now,
+            now
+        ))
 
-    db.commit()
-    db.refresh(player)
+        row = con.execute(
+            "SELECT * FROM players WHERE telegram_id=?",
+            (payload.telegram_id,)
+        ).fetchone()
 
-    return {
-        "message": "Player registered",
-        "player": {
-            "id": player.id,
-            "telegram_id": player.telegram_id,
-            "nickname": player.nickname,
-            "game_id": player.game_id,
-            "rating": player.rating,
-        }
-    }
+    return {"status": "registered", "player": dict(row)}
 
 
 @app.get("/players/{telegram_id}")
-def get_player(telegram_id: str, db: Session = Depends(get_db)):
-    player = db.query(Player).filter_by(telegram_id=telegram_id).first()
-    if not player:
-        raise HTTPException(404, "Player not found")
+def get_player(telegram_id: str):
+    with db() as con:
+        row = con.execute(
+            "SELECT * FROM players WHERE telegram_id=?",
+            (telegram_id,)
+        ).fetchone()
 
-    return {
-        "id": player.id,
-        "telegram_id": player.telegram_id,
-        "nickname": player.nickname,
-        "game_id": player.game_id,
-        "rating": player.rating,
-    }
+    if not row:
+        raise HTTPException(404, "Игрок не зарегистрирован")
+
+    return dict(row)
 
 
 @app.post("/queue/join")
-def join_queue(data: QueueRequest, db: Session = Depends(get_db)):
-    if data.mode not in ("2v2", "5v5"):
-        raise HTTPException(400, "Mode must be 2v2 or 5v5")
+def join_queue(payload: JoinQueue):
+    mode = payload.mode.strip().lower()
 
-    player = db.query(Player).filter_by(
-        telegram_id=data.telegram_id
-    ).first()
-    if not player:
-        raise HTTPException(404, "Register your player first")
+    if mode not in {"1v1", "2v2", "3v3", "5v5"}:
+        raise HTTPException(400, "Неподдерживаемый режим")
 
-    active_match = (
-        db.query(MatchPlayer)
-        .join(Match, Match.id == MatchPlayer.match_id)
-        .filter(
-            MatchPlayer.player_id == player.id,
-            Match.status.in_(["waiting", "ready"])
-        )
-        .first()
-    )
-    if active_match:
-        raise HTTPException(409, "Player already has an active match")
+    with db() as con:
+        player = con.execute(
+            "SELECT telegram_id FROM players WHERE telegram_id=?",
+            (payload.telegram_id,)
+        ).fetchone()
 
-    existing = db.query(QueueEntry).filter_by(player_id=player.id).first()
-    if existing:
-        if existing.mode == data.mode:
-            return {"status": "already_in_queue", "mode": existing.mode}
-        db.delete(existing)
-        db.flush()
+        if not player:
+            raise HTTPException(
+                400, "Сначала зарегистрируй игровой ID в профиле"
+            )
 
-    entry = QueueEntry(player_id=player.id, mode=data.mode)
-    db.add(entry)
-    db.flush()
-
-    team_size = 2 if data.mode == "2v2" else 5
-    needed = team_size * 2
-
-    entries = (
-        db.query(QueueEntry)
-        .filter_by(mode=data.mode)
-        .order_by(QueueEntry.created_at, QueueEntry.id)
-        .limit(needed)
-        .all()
-    )
-
-    if len(entries) < needed:
-        db.commit()
-        return {
-            "status": "queued",
-            "mode": data.mode,
-            "players_found": len(entries),
-            "players_needed": needed,
-        }
-
-    player_ids = [item.player_id for item in entries]
-    random.shuffle(player_ids)
-
-    match = Match(
-        mode=data.mode,
-        status="ready",
-        captain_player_id=player_ids[0],
-    )
-    db.add(match)
-    db.flush()
-
-    for index, player_id in enumerate(player_ids):
-        db.add(MatchPlayer(
-            match_id=match.id,
-            player_id=player_id,
-            team=1 if index < team_size else 2,
+        con.execute("""
+            INSERT INTO queue (telegram_id, mode, joined_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+            mode=excluded.mode, joined_at=excluded.joined_at
+        """, (
+            payload.telegram_id,
+            mode,
+            datetime.now(timezone.utc).isoformat()
         ))
 
-    for item in entries:
-        db.delete(item)
+        players = [
+            row["telegram_id"]
+            for row in con.execute(
+                "SELECT telegram_id FROM queue WHERE mode=? ORDER BY joined_at",
+                (mode,)
+            ).fetchall()
+        ]
 
-    db.commit()
+        needed = int(mode.split("v")[0]) * 2
 
-    return {
-        "status": "match_found",
-        "match_id": match.id,
-        "mode": match.mode,
-        "players": needed,
-        "captain_player_id": match.captain_player_id,
-        "message": "Match created. Captain must create the game lobby manually."
-    }
+        if len(players) >= needed:
+            chosen = players[:needed]
+            match_id = str(uuid.uuid4())[:8]
+
+            con.execute("""
+                INSERT INTO matches
+                (match_id, mode, status, players_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                match_id,
+                mode,
+                "ready",
+                json.dumps(chosen),
+                datetime.now(timezone.utc).isoformat()
+            ))
+
+            con.executemany(
+                "DELETE FROM queue WHERE telegram_id=?",
+                [(pid,) for pid in chosen]
+            )
+
+            return {
+                "status": "matched",
+                "mode": mode,
+                "match_id": match_id,
+                "players_found": needed,
+                "players_needed": needed,
+                "players": chosen
+            }
+
+        return {
+            "status": "queued",
+            "mode": mode,
+            "players_found": len(players),
+            "players_needed": needed,
+            "players_remaining": needed - len(players)
+        }
 
 
 @app.post("/queue/leave")
-def leave_queue(telegram_id: str, db: Session = Depends(get_db)):
-    player = db.query(Player).filter_by(telegram_id=telegram_id).first()
-    if not player:
-        raise HTTPException(404, "Player not found")
+def leave_queue(payload: LeaveQueue):
+    with db() as con:
+        cur = con.execute(
+            "DELETE FROM queue WHERE telegram_id=?",
+            (payload.telegram_id,)
+        )
 
-    entry = db.query(QueueEntry).filter_by(player_id=player.id).first()
-    if not entry:
-        return {"status": "not_in_queue"}
-
-    db.delete(entry)
-    db.commit()
-    return {"status": "left_queue"}
+    return {
+        "status": "left_queue",
+        "removed": cur.rowcount > 0
+    }
 
 
 @app.get("/queue/{mode}")
-def queue_status(mode: str, db: Session = Depends(get_db)):
-    if mode not in ("2v2", "5v5"):
-        raise HTTPException(400, "Mode must be 2v2 or 5v5")
+def queue_status(mode: str):
+    mode = mode.lower()
 
-    count = db.query(QueueEntry).filter_by(mode=mode).count()
-    needed = 4 if mode == "2v2" else 10
+    with db() as con:
+        rows = con.execute(
+            "SELECT telegram_id, joined_at FROM queue WHERE mode=? ORDER BY joined_at",
+            (mode,)
+        ).fetchall()
+
+    needed = (
+        int(mode.split("v")[0]) * 2
+        if "v" in mode and mode.split("v")[0].isdigit()
+        else 0
+    )
 
     return {
         "mode": mode,
-        "players_found": count,
+        "players_found": len(rows),
         "players_needed": needed,
+        "players": [dict(row) for row in rows]
     }
 
 
 @app.get("/matches/{match_id}")
-def get_match(match_id: int, db: Session = Depends(get_db)):
-    match = db.query(Match).filter_by(id=match_id).first()
-    if not match:
-        raise HTTPException(404, "Match not found")
+def get_match(match_id: str):
+    with db() as con:
+        row = con.execute(
+            "SELECT * FROM matches WHERE match_id=?",
+            (match_id,)
+        ).fetchone()
 
-    members = (
-        db.query(MatchPlayer, Player)
-        .join(Player, Player.id == MatchPlayer.player_id)
-        .filter(MatchPlayer.match_id == match_id)
-        .all()
+    if not row:
+        raise HTTPException(404, "Матч не найден")
+
+    data = dict(row)
+    data["players"] = json.loads(data.pop("players_json"))
+    data["result"] = (
+        json.loads(data["result_json"])
+        if data.get("result_json")
+        else None
     )
+    data.pop("result_json", None)
 
-    return {
-        "id": match.id,
-        "mode": match.mode,
-        "status": match.status,
-        "map_name": match.map_name,
-        "captain_player_id": match.captain_player_id,
-        "winner_team": match.winner_team,
-        "players": [
-            {
-                "telegram_id": player.telegram_id,
-                "nickname": player.nickname,
-                "game_id": player.game_id,
-                "team": membership.team,
-            }
-            for membership, player in members
-        ],
-    }
+    return data
 
 
 @app.post("/matches/{match_id}/result")
-def report_result(
-    match_id: int,
-    data: ResultRequest,
-    db: Session = Depends(get_db),
-):
-    match = db.query(Match).filter_by(id=match_id).first()
-    if not match:
-        raise HTTPException(404, "Match not found")
-    if match.status != "ready":
-        raise HTTPException(409, "Match is not accepting results")
-
-    player = db.query(Player).filter_by(
-        telegram_id=data.telegram_id
-    ).first()
-    if not player:
-        raise HTTPException(404, "Player not found")
-
-    membership = db.query(MatchPlayer).filter_by(
-        match_id=match_id,
-        player_id=player.id,
-    ).first()
-    if not membership:
-        raise HTTPException(403, "You are not in this match")
-
-    membership.confirmed_result = data.winner_team
-    db.flush()
-
-    reports = (
-        db.query(MatchPlayer)
-        .filter_by(match_id=match_id)
-        .all()
-    )
-    teams = {report.team for report in reports}
-    team_votes = {
-        team: sum(
-            1 for report in reports
-            if report.team == team
-            and report.confirmed_result == data.winner_team
-        )
-        for team in teams
+def submit_result(match_id: str, payload: MatchResult):
+    result = payload.result if payload.result is not None else {
+        "winner": payload.winner,
+        "telegram_id": payload.telegram_id
     }
 
-    # A result is finalized only when every player confirms the same winner.
-    if reports and all(
-        report.confirmed_result == data.winner_team
-        for report in reports
-    ):
-        match.winner_team = data.winner_team
-        match.status = "completed"
+    with db() as con:
+        row = con.execute(
+            "SELECT match_id FROM matches WHERE match_id=?",
+            (match_id,)
+        ).fetchone()
 
-    db.commit()
+        if not row:
+            raise HTTPException(404, "Матч не найден")
+
+        con.execute(
+            "UPDATE matches SET status=?, result_json=? WHERE match_id=?",
+            (
+                "finished",
+                json.dumps(result, ensure_ascii=False),
+                match_id
+            )
+        )
 
     return {
-        "status": match.status,
-        "reported_winner_team": data.winner_team,
-        "message": (
-            "Result confirmed"
-            if match.status == "completed"
-            else "Waiting for all players to confirm the same result"
-        ),
+        "status": "result_saved",
+        "match_id": match_id,
+        "result": result
     }

@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 sqlalchemy
 psycopg[binary]
+python-multipart>=0.0.9,<1.0

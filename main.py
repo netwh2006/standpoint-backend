@@ -34,7 +34,7 @@ MAPS = {
 
 app = FastAPI(
     title="STANDPOINT Competitive Match API",
-    version="3.0.0"
+    version="3.1.0"
 )
 
 app.add_middleware(
@@ -302,6 +302,8 @@ def init_db():
             ("matches", "elo_applied",
              "INTEGER NOT NULL DEFAULT 0"),
             ("matches", "updated_at", "TEXT"),
+            ("matches", "acceptance_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("matches", "accept_deadline", "TEXT"),
             ("match_history", "elo_before", "INTEGER NOT NULL DEFAULT 0"),
             ("match_history", "elo_delta", "INTEGER NOT NULL DEFAULT 0"),
         ]
@@ -364,6 +366,19 @@ class LeaveQueue(BaseModel):
     telegram_id: str = Field(min_length=1, max_length=64)
 
 
+class MatchAcceptance(BaseModel):
+    telegram_id: str = Field(min_length=1, max_length=64)
+    accepted: bool = True
+
+
+class MatchResultSubmit(BaseModel):
+    telegram_id: str = Field(min_length=1, max_length=64)
+    score_a: int = Field(ge=0, le=100)
+    score_b: int = Field(ge=0, le=100)
+    stats: dict[str, dict[str, int]] = Field(default_factory=dict)
+    note: str = Field(default="", max_length=1000)
+
+
 class CaptainSelect(BaseModel):
     captain_id: str = Field(min_length=1, max_length=64)
     team: Literal["A", "B"] = "A"
@@ -422,13 +437,14 @@ def load_match(con, match_id):
         ("map_actions_json", "map_actions"),
         ("evidence_json", "evidence"),
         ("stats_json", "stats"),
+        ("acceptance_json", "acceptance"),
     ]
 
     for field, key in fields:
         try:
             default = "[]" if key == "map_actions" else "{}"
             data[key] = json.loads(data.pop(field) or default)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, TypeError):
             data[key] = [] if key == "map_actions" else {}
 
     return data
@@ -441,12 +457,26 @@ def require_match_player(match, telegram_id):
         )
 
 
+def attach_match_profiles(con, match):
+    ids = list(dict.fromkeys(match.get("players") or []))
+    if not ids:
+        match["player_profiles"] = {}
+        return match
+    placeholders = ",".join("?" for _ in ids)
+    rows = con.execute(
+        f"SELECT telegram_id,nickname,elo,game_id FROM players WHERE telegram_id IN ({placeholders})",
+        ids,
+    ).fetchall()
+    match["player_profiles"] = {r["telegram_id"]: dict(r) for r in rows}
+    return match
+
+
 @app.get("/")
 def root():
     return {
         "service": "STANDPOINT Competitive Match API",
         "status": "ok",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "docs": "/docs",
         "moderator_username": "@" + MODERATOR_USERNAME,
     }
@@ -577,7 +607,7 @@ def join_queue(payload: JoinQueue):
         active = con.execute("""
             SELECT match_id FROM matches
             WHERE status IN (
-                'ready', 'map_pick', 'playing',
+                'accepting', 'ready', 'map_pick', 'playing',
                 'awaiting_evidence', 'under_review',
                 'disputed'
             )
@@ -626,12 +656,16 @@ def join_queue(payload: JoinQueue):
         con.execute("""
             INSERT INTO matches(
                 match_id, mode, status, players_json,
-                captain_id, created_at, updated_at
+                captain_id, acceptance_json, accept_deadline,
+                created_at, updated_at
             )
-            VALUES(?,?,?,?,?,?,?)
+            VALUES(?,?,?,?,?,?,?,?,?)
         """, (
-            match_id, mode, "map_pick",
-            json.dumps(chosen), captain, stamp, stamp
+            match_id, mode, "accepting",
+            json.dumps(chosen), captain,
+            json.dumps({pid: False for pid in chosen}),
+            (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat(),
+            stamp, stamp
         ))
 
         con.executemany(
@@ -644,14 +678,53 @@ def join_queue(payload: JoinQueue):
                 {"match_id": match_id, "mode": mode})
 
     return {
-        "status": "matched",
+        "status": "match_found",
         "match_id": match_id,
         "mode": mode,
         "players": chosen,
         "teams": {"A": team_a, "B": team_b},
         "captain_id": captain,
-        "next_step": "ban_pick",
+        "accepted_count": 0,
+        "players_needed": needed,
+        "accept_deadline": (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat(),
+        "next_step": "accept_match",
     }
+
+
+@app.post("/matches/{match_id}/accept")
+def accept_match(match_id: str, payload: MatchAcceptance):
+    stamp = now()
+    with db() as con:
+        match = load_match(con, match_id)
+        require_match_player(match, payload.telegram_id)
+        if match["status"] != "accepting":
+            raise HTTPException(409, "ÐÐ¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÐµÐ½Ð¸Ðµ Ð¼Ð°ÑÑÐ° ÑÐ¶Ðµ Ð·Ð°ÐºÑÑÑÐ¾")
+        deadline = match.get("accept_deadline")
+        if deadline:
+            try:
+                if datetime.fromisoformat(deadline) < datetime.now(timezone.utc):
+                    con.execute("UPDATE matches SET status='expired', updated_at=? WHERE match_id=?", (stamp, match_id))
+                    for pid in match["players"]:
+                        if pid != payload.telegram_id:
+                            con.execute("INSERT OR IGNORE INTO queue(telegram_id,mode,joined_at) VALUES(?,?,?)", (pid, match["mode"], stamp))
+                    return {"status":"expired", "match_id":match_id, "message":"ÐÑÐµÐ¼Ñ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÐµÐ½Ð¸Ñ Ð¸ÑÑÐµÐºÐ»Ð¾. ÐÐ¾Ð¸ÑÐº Ð½ÑÐ¶Ð½Ð¾ Ð·Ð°Ð¿ÑÑÑÐ¸ÑÑ Ð·Ð°Ð½Ð¾Ð²Ð¾"}
+            except ValueError:
+                pass
+        acceptance = match.get("acceptance") or {pid: False for pid in match["players"]}
+        if not payload.accepted:
+            con.execute("UPDATE matches SET status='declined', acceptance_json=?, updated_at=? WHERE match_id=?", (json.dumps(acceptance), stamp, match_id))
+            for pid in match["players"]:
+                if pid != payload.telegram_id:
+                    con.execute("INSERT OR IGNORE INTO queue(telegram_id,mode,joined_at) VALUES(?,?,?)", (pid, match["mode"], stamp))
+            return {"status":"declined", "match_id":match_id, "accepted_count":sum(bool(v) for v in acceptance.values()), "players_needed":len(match["players"])}
+        acceptance[payload.telegram_id] = True
+        accepted_count = sum(bool(v) for v in acceptance.values())
+        next_status = "map_pick" if accepted_count == len(match["players"]) else "accepting"
+        con.execute("UPDATE matches SET acceptance_json=?, status=?, updated_at=? WHERE match_id=?", (json.dumps(acceptance), next_status, stamp, match_id))
+        if next_status == "map_pick":
+            for pid in match["players"]:
+                create_notification(con, pid, "match_accepted", "ÐÐ°ÑÑ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÑÐ½", f"ÐÑÐµ Ð¸Ð³ÑÐ¾ÐºÐ¸ Ð¿ÑÐ¸Ð½ÑÐ»Ð¸ Ð¼Ð°ÑÑ {match_id}", {"match_id":match_id})
+    return {"status":"accepted", "match_id":match_id, "accepted_count":accepted_count, "players_needed":len(match["players"]), "match_status":next_status}
 
 
 @app.post("/queue/leave")
@@ -691,10 +764,35 @@ def queue_status(mode: str):
     }
 
 
+@app.get("/players/{telegram_id}/active-match")
+def active_match_for_player(telegram_id: str):
+    active_statuses = {"accepting", "map_pick", "ready", "playing", "awaiting_evidence", "under_review", "disputed", "confirmed", "rejected"}
+    with db() as con:
+        rows = con.execute("SELECT match_id, players_json FROM matches ORDER BY created_at DESC LIMIT 100").fetchall()
+        for row in rows:
+            try:
+                players = json.loads(row["players_json"] or "[]")
+            except json.JSONDecodeError:
+                continue
+            if telegram_id in players:
+                match = attach_match_profiles(con, load_match(con, row["match_id"]))
+                if match.get("status") in active_statuses:
+                    acceptance = match.get("acceptance") or {}
+                    match["accepted_count"] = sum(bool(v) for v in acceptance.values())
+                    match["players_needed"] = len(players)
+                    return {"active": True, "match": match}
+    return {"active": False, "match": None}
+
+
 @app.get("/matches/{match_id}")
 def get_match(match_id: str):
     with db() as con:
-        return load_match(con, match_id)
+        match = attach_match_profiles(con, load_match(con, match_id))
+        acceptance = match.get("acceptance") or {}
+        match["accepted_count"] = sum(bool(v) for v in acceptance.values())
+        match["players_needed"] = len(match.get("players") or [])
+        match["acceptance"] = acceptance
+        return match
 
 
 @app.post("/matches/{match_id}/captain")
@@ -816,6 +914,31 @@ def start_match(match_id: str, telegram_id: str):
         """, (now(), match_id))
 
     return {"status": "playing", "match_id": match_id}
+
+
+@app.post("/matches/{match_id}/result")
+def submit_match_result(match_id: str, payload: MatchResultSubmit):
+    stamp = now()
+    with db() as con:
+        match = load_match(con, match_id)
+        require_match_player(match, payload.telegram_id)
+        if match["status"] != "playing":
+            raise HTTPException(409, "Ð ÐµÐ·ÑÐ»ÑÑÐ°Ñ Ð¼Ð¾Ð¶Ð½Ð¾ Ð¾ÑÐ¿ÑÐ°Ð²Ð¸ÑÑ ÑÐ¾Ð»ÑÐºÐ¾ Ð¿Ð¾ÑÐ»Ðµ ÑÑÐ°ÑÑÐ° Ð¼Ð°ÑÑÐ°")
+        winner = "A" if payload.score_a > payload.score_b else "B" if payload.score_b > payload.score_a else "draw"
+        evidence = match.get("evidence") or {}
+        evidence[payload.telegram_id] = {
+            "claimed_score_a": payload.score_a,
+            "claimed_score_b": payload.score_b,
+            "submitted_at": stamp,
+            "note": payload.note,
+            "type": "score_report"
+        }
+        stats = match.get("stats") or {}
+        stats.update(payload.stats or {})
+        con.execute("""UPDATE matches SET score_a=?, score_b=?, winner=?, evidence_json=?, stats_json=?, status='under_review', review_note=?, updated_at=? WHERE match_id=?""",
+                    (payload.score_a, payload.score_b, winner, json.dumps(evidence), json.dumps(stats), payload.note, stamp, match_id))
+        create_notification(con, payload.telegram_id, "result_submitted", "Ð ÐµÐ·ÑÐ»ÑÑÐ°Ñ Ð¾ÑÐ¿ÑÐ°Ð²Ð»ÐµÐ½", "Ð ÐµÐ·ÑÐ»ÑÑÐ°Ñ Ð¼Ð°ÑÑÐ° Ð¿ÐµÑÐµÐ´Ð°Ð½ Ð¼Ð¾Ð´ÐµÑÐ°ÑÐ¾ÑÑ Ð½Ð° Ð¿ÑÐ¾Ð²ÐµÑÐºÑ.", {"match_id":match_id})
+    return {"status":"under_review", "match_id":match_id, "score_a":payload.score_a, "score_b":payload.score_b, "winner":winner, "elo_changed":False}
 
 
 @app.post("/matches/{match_id}/evidence")
@@ -1784,6 +1907,18 @@ def report_clan_war_result(war_id: str, payload: ClanWarResult):
         create_notification(con, payload.telegram_id, "clan_war_result_submitted", "Ð ÐµÐ·ÑÐ»ÑÑÐ°Ñ Clan War Ð¾ÑÐ¿ÑÐ°Ð²Ð»ÐµÐ½ Ð½Ð° Ð¿ÑÐ¾Ð²ÐµÑÐºÑ", "",
                             {"war_id": war_id})
     return {"status": "under_review", "winner_clan_id": winner}
+
+
+@app.get("/clan-wars/{war_id}/lobby")
+def clan_war_lobby(war_id: str):
+    with db() as con:
+        row = con.execute("""SELECT w.*, a.name AS clan_a_name, a.tag AS clan_a_tag, b.name AS clan_b_name, b.tag AS clan_b_tag FROM clan_wars w JOIN clans a ON a.clan_id=w.clan_a JOIN clans b ON b.clan_id=w.clan_b WHERE w.war_id=?""", (war_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Clan War Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½")
+        war = dict(row)
+        roster_a = [dict(r) for r in con.execute("SELECT p.telegram_id,p.nickname,p.elo,cm.role FROM clan_members cm JOIN players p ON p.telegram_id=cm.telegram_id WHERE cm.clan_id=? ORDER BY CASE cm.role WHEN 'owner' THEN 0 WHEN 'officer' THEN 1 ELSE 2 END,p.elo DESC", (war["clan_a"],)).fetchall()]
+        roster_b = [dict(r) for r in con.execute("SELECT p.telegram_id,p.nickname,p.elo,cm.role FROM clan_members cm JOIN players p ON p.telegram_id=cm.telegram_id WHERE cm.clan_id=? ORDER BY CASE cm.role WHEN 'owner' THEN 0 WHEN 'officer' THEN 1 ELSE 2 END,p.elo DESC", (war["clan_b"],)).fetchall()]
+    return {"war":war, "teams":{"A":roster_a,"B":roster_b}, "format":"5v5", "lobby_ready":war["status"] == "accepted"}
 
 
 @app.get("/clan-wars/{clan_id}")

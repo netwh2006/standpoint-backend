@@ -146,6 +146,13 @@ def init_db():
         # Feature tables added in v3.0.0. Kept in the same SQLite database
         # to preserve the existing deployment and database path.
         con.executescript("""
+            CREATE TABLE IF NOT EXISTS player_avatars (
+                telegram_id TEXT PRIMARY KEY,
+                content_type TEXT NOT NULL,
+                data BLOB NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(telegram_id) REFERENCES players(telegram_id) ON DELETE CASCADE
+            );
             CREATE TABLE IF NOT EXISTS notifications (
                 notification_id TEXT PRIMARY KEY,
                 telegram_id TEXT NOT NULL,
@@ -2145,3 +2152,30 @@ def clan_leaderboard(limit: int = 50):
             LEFT JOIN clan_members cm ON cm.clan_id=c.clan_id
             GROUP BY c.clan_id ORDER BY c.elo DESC,c.wins DESC LIMIT ?""", (limit,)).fetchall()
     return {"clans": [dict(r) for r in rows]}
+
+
+# STANDPOINT profile avatar endpoints (persistent SQLite storage)
+@app.post("/players/{telegram_id}/avatar")
+def upload_player_avatar(telegram_id: str, file: UploadFile = File(...)):
+    content_type = (file.content_type or "").lower()
+    if not content_type.startswith("image/"):
+        raise HTTPException(400, "Ð Ð°Ð·ÑÐµÑÐµÐ½Ñ ÑÐ¾Ð»ÑÐºÐ¾ Ð¸Ð·Ð¾Ð±ÑÐ°Ð¶ÐµÐ½Ð¸Ñ")
+    data = file.file.read(3 * 1024 * 1024 + 1)
+    if not data or len(data) > 3 * 1024 * 1024:
+        raise HTTPException(413, "Ð Ð°Ð·Ð¼ÐµÑ Ð°Ð²Ð°ÑÐ°ÑÐ° Ð´Ð¾Ð»Ð¶ÐµÐ½ Ð±ÑÑÑ Ð½Ðµ Ð±Ð¾Ð»ÐµÐµ 3 ÐÐ")
+    with db() as con:
+        exists = con.execute("SELECT 1 FROM players WHERE telegram_id=?", (telegram_id,)).fetchone()
+        if not exists:
+            raise HTTPException(404, "ÐÐ³ÑÐ¾Ðº Ð½Ðµ Ð·Ð°ÑÐµÐ³Ð¸ÑÑÑÐ¸ÑÐ¾Ð²Ð°Ð½")
+        con.execute("""INSERT INTO player_avatars(telegram_id,content_type,data,updated_at) VALUES(?,?,?,?)
+            ON CONFLICT(telegram_id) DO UPDATE SET content_type=excluded.content_type,data=excluded.data,updated_at=excluded.updated_at""",
+            (telegram_id, content_type, data, now()))
+    return {"status": "uploaded", "telegram_id": telegram_id, "url": f"/players/{telegram_id}/avatar"}
+
+@app.get("/players/{telegram_id}/avatar")
+def get_player_avatar(telegram_id: str):
+    with db() as con:
+        row = con.execute("SELECT content_type,data FROM player_avatars WHERE telegram_id=?", (telegram_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "ÐÐ²Ð°ÑÐ°Ñ Ð½Ðµ Ð·Ð°Ð³ÑÑÐ¶ÐµÐ½")
+    return Response(content=row["data"], media_type=row["content_type"], headers={"Cache-Control": "public, max-age=300"})
